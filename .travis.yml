@@ -1,0 +1,9 @@
+language: node_js
+node_js:
+  - 'node'
+  - 'lts/*'
+cache:
+  directories:
+    - 'node_modules'
+install:
+  - [ -f package-lock.json ] && [ npm ci --help ] && npm ci || npm install
