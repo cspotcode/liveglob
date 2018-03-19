@@ -17,35 +17,37 @@ interface FSWatcherInternal extends FSWatcher {
 }
 
 export class LiveGlobFactory extends AbstractGlobState(EventEmitter) {
-    constructor(opts: {
-        cwd: string;
-    }) {
+    constructor(opts: LGFOptions) {
         super();
         this._cwd = Path.resolve(opts.cwd);
+        this._watcher = chokidar.watch([], {cwd: this._cwd}) as FSWatcherInternal;
+        this._emitReady = this._watcher._emitReady;
         // HACK each time ready is fired, allow it to be fired again
-        this._watcher.on('ready', () => {
-            (this._watcher as FSWatcherInternal)._emitReady = this._emitReady;
-        });
+        // this._watcher.on('ready', () => {
+        //     this._watcher._emitReady = this._emitReady;
+        // });
         register(this._watcher, this, false);
     }
     /** @internal */
-    public _watcher = chokidar.watch([]);
+    public _watcher: FSWatcherInternal;
     /**
      * @internal
      * MUST be absolute and normalized to native path separators
      */
     public _cwd: string;
-    private _emitReady = (this._watcher as FSWatcherInternal)._emitReady;
+    private _emitReady: FSWatcherInternal['_emitReady'];
     private _lastCreatePromise: Promise<LiveGlob> | undefined;
+    private _openChildren: number = 0;
     /** @internal */
     matches() { return true; }
     /** @internal */
     normalizePath(p: string) { return p; }
 
     /** Create a new LiveGlob instance, watching a set of glob patterns */
-    async create(globs: string | Array<string>, {
-        initialStateConsideredDirty = true
-    }: Options) {
+    async create(globs: string | Array<string>, options: LGOptions) {
+        if(this._closed) {
+            throw new Error('This factory has already been closed.');
+        }
         const _globs = Array.isArray(globs) ? globs : [globs];
         // atomically ensure that anyone else trying to create()
         // will wait until we're done
@@ -56,8 +58,19 @@ export class LiveGlobFactory extends AbstractGlobState(EventEmitter) {
                 this._watcher.once('ready', () => res());
                 this._watcher.once('error', rej);
             });
-            return new LiveGlob(_globs, this, {initialStateConsideredDirty});
+            const lg = new LiveGlob(_globs, this, options);
+            this._openChildren++;
+            return lg;
         })();
+    }
+    protected _closeIt() {
+        this._watcher.close();
+    }
+    _childClosed() {
+        --this._openChildren;
+        if(this._openChildren <= 0) {
+            this.close();
+        }
     }
 }
 
@@ -80,12 +93,17 @@ export interface Options {
     absolute?: boolean;
 }
 
+/** Options passed to internal LiveGlob constructor */
+type LGOptions = Required<Pick<Options, Exclude<keyof Options, 'cwd'>>>;
+/** Options passed to internal LiveGlobFactory constructor */
+type LGFOptions = Required<Pick<Options, 'cwd'>>;
+
 export class LiveGlob extends AbstractGlobWithDiffState(AbstractGlobState(EventEmitter)) {
     constructor(public readonly globs: ReadonlyArray<string>, private readonly _factory: LiveGlobFactory, {
-        initialStateConsideredDirty = false,
-        delimiter = 'native',
-        absolute = false
-    }: Options) {
+        initialStateConsideredDirty,
+        delimiter,
+        absolute
+    }: LGOptions) {
         super();
         register(_factory._watcher, this, true);
         this._matcher = anymatch(globs as string[]);
@@ -114,8 +132,12 @@ export class LiveGlob extends AbstractGlobWithDiffState(AbstractGlobState(EventE
     }
     /** @internal */
     normalizePath(rawPath: string) {
-        const path = this._absolutePaths ? Path.join(this._factory._cwd, rawPath) : rawPath;
+        const path = this._absolutePaths ? makeAbsolute(this._factory._cwd, rawPath) : rawPath;
         return this._forceForwardSlash ? posixDelim(path) : path;
+    }
+
+    protected _closeIt() {
+        this._factory._childClosed();
     }
 
     on(event: 'add', callback: (filePath: string, stats: Stats | undefined) => void): this;
@@ -151,6 +173,15 @@ export function AbstractGlobState<C extends Constructor<any>>(Base: C) {
         /** Should a given path be included in this state? */
         abstract matches(rawPath: string): boolean;
         abstract normalizePath(rawPath: string): string;
+        /** @internal */
+        protected _closed = false;
+        close() {
+            if(!this._closed) {
+                this._closed = true;
+                this._closeIt();
+            }
+        }
+        protected abstract _closeIt(): void;
     }
 
     return _AbstractGlobState;
@@ -190,6 +221,7 @@ function register(w: chokidar.FSWatcher, i: AbstractGlobState & EventEmitter, re
 function register(w: chokidar.FSWatcher, i: (AbstractGlobState | AbstractGlobWithDiffState) & EventEmitter, registerDiffLogic: boolean) {
     function filteredEvent(name: string, action: (rawPath: string, normalizedPath: string) => void) {
         w.on(name, (rawPath, stats) => {
+            if(i._closed) return;
             if(i.matches(rawPath)) {
                 const normalizedPath = i.normalizePath(rawPath);
                 action(rawPath, normalizedPath);
@@ -227,6 +259,7 @@ function register(w: chokidar.FSWatcher, i: (AbstractGlobState | AbstractGlobWit
         }
     });
     filteredEvent('unlink', (rawPath, normalizedPath) => {
+        console.log('unlink fired', rawPath);
         i.files.delete(normalizedPath);
         if(doDiff(i)) {
             // If file was already added, it's now gone, as if nothing happened.
@@ -237,6 +270,7 @@ function register(w: chokidar.FSWatcher, i: (AbstractGlobState | AbstractGlobWit
         }
     });
     filteredEvent('unlinkDir', (rawPath, normalizedPath) => {
+        console.log('unlinkDir fired', rawPath);
         i.directories.delete(normalizedPath);
         if(doDiff(i)) {
             if(!i.addedDirectories.delete(normalizedPath)) {
@@ -251,3 +285,7 @@ const posixDelim =
     process.platform === 'win32'
     ? (path: string) => path.replace(/\\/g, '/')
     : (path: string) => path;
+
+function makeAbsolute(cwd: string, path: string) {
+    return Path.resolve(cwd, path);
+}

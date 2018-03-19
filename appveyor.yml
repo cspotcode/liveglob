@@ -1,3 +1,4 @@
+# Use Appveyor to test on Windows
 environment:
   matrix:
     - nodejs_version: ''

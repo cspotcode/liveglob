@@ -1,4 +1,8 @@
+# Use Travis to test on Mac and Linux
 language: node_js
+os:
+  - linux
+  - osx
 node_js:
   - 'node'
   - 'lts/*'
