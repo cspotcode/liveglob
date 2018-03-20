@@ -11,7 +11,7 @@ install:
 test_script:
   - node --version
   - npm --version
-  - npm run build
+#   - npm run build
   - npm test
 
 # Don't actually build.
