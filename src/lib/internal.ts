@@ -6,106 +6,87 @@ import { FSWatcher } from 'chokidar';
 import anymatch from 'anymatch';
 // import { EventEmitter, E, NodeEventEmitter } from './better-event-emitter';
 import { Stats } from 'fs';
+import { EventEmitter as EE } from 'single-event-emitter';
 import { EventEmitter } from 'events';
-import { Constructor, ANY } from './misc';
+import { Constructor, ANY, MixinConstructorType, MixinType } from './misc';
 import { memoize } from 'lodash';
 import * as Path from 'path';
+import { Watcher, NotificationReceiver, NotificationEmitter, WatcherInterface } from './adapter';
+import { WatchmanProvider } from './watchman-adapter';
+import { ChokidarProvider } from './chokidar-adapter';
+import { Disposable, DisposableConstructor } from './disposable';
+import { Options } from './index';
 
-/** Expose internal details of chokidar's FSWatcher */
-interface FSWatcherInternal extends FSWatcher {
-    _emitReady(): void;
-}
+type A = EE;
 
-export class LiveGlobFactory extends AbstractGlobState(EventEmitter) {
+/**
+ * Stores an in-memory representation of filesystem state without any glob filtering.
+ * LiveGlob instances can be created via a factory and immediately populate their
+ * internal state from their parent LiveGlobFactory.
+ * 
+ * Generally you have one LiveGlobFactory per cwd.
+ */
+export class LiveGlobFactory extends GlobState(Disposable(EventEmitter)) {
     constructor(opts: LGFOptions) {
         super();
         this._cwd = Path.resolve(opts.cwd);
-        this._watcher = chokidar.watch([], {cwd: this._cwd}) as FSWatcherInternal;
-        this._emitReady = this._watcher._emitReady;
-        // HACK each time ready is fired, allow it to be fired again
-        // this._watcher.on('ready', () => {
-        //     this._watcher._emitReady = this._emitReady;
-        // });
-        register(this._watcher, this, false);
+        this._watcherInterface = opts.watcherInterface;
+
+        this.disposeOnLastChildDisposed(true);
+
+        bindGlobStateToWatcher(this._watcherInterface.observables, this, false);
     }
     /** @internal */
-    public _watcher: FSWatcherInternal;
+    public _watcherInterface: WatcherInterface;
     /**
      * @internal
      * MUST be absolute and normalized to native path separators
      */
     public _cwd: string;
-    private _emitReady: FSWatcherInternal['_emitReady'];
-    private _lastCreatePromise: Promise<LiveGlob> | undefined;
-    private _openChildren: number = 0;
-    /** @internal */
-    matches() { return true; }
     /** @internal */
     normalizePath(p: string) { return p; }
 
     /** Create a new LiveGlob instance, watching a set of glob patterns */
-    async create(globs: string | Array<string>, options: LGOptions) {
-        if(this._closed) {
+    create(globs: string | Array<string>, options: LGOptions) {
+        if(this.isDisposed()) {
             throw new Error('This factory has already been closed.');
         }
         const _globs = Array.isArray(globs) ? globs : [globs];
-        // atomically ensure that anyone else trying to create()
-        // will wait until we're done
-        return this._lastCreatePromise = (async () => {
-            await this._lastCreatePromise;
-            this._watcher.add(globs);
-            await new Promise((res, rej) => {
-                this._watcher.once('ready', () => res());
-                this._watcher.once('error', rej);
-            });
-            const lg = new LiveGlob(_globs, this, options);
-            this._openChildren++;
-            return lg;
-        })();
-    }
-    protected _closeIt() {
-        this._watcher.close();
-    }
-    _childClosed() {
-        --this._openChildren;
-        if(this._openChildren <= 0) {
-            this.close();
-        }
-    }
-}
 
-export interface Options {
-    cwd?: string;
-    /**
-     * globs are evaluated relative to this directory
-     * relative paths are relative to this directory (if `absolute` is false)
-     */
-    initialStateConsideredDirty?: boolean;
-    /**
-     * If 'posix', all paths are normalized to use posix-style '/' path delimiter.  If 'native' they will use '\' on Windows and '/' everywhere else.
-     */
-    delimiter?: 'native' | 'posix',
-    /**
-     * All paths are absolute rather than being relative to `cwd`
-     * Does not affect glob matching
-     * Default: false
-     */
-    absolute?: boolean;
+        const lg = new LiveGlob(_globs, this, {
+            absolute: options.absolute,
+            delimiter: options.delimiter,
+            initialStateConsideredDirty: options.initialStateConsideredDirty,
+            notificationEmitter: this._watcherInterface.observables
+        });
+        // take ownership so that when child is disposed, we auto-dispose as well
+        lg.setOwner(this);
+        return lg;
+    }
+    protected performDisposal() {
+        // TODO how to dispose the native adapter?
+        this._watcherInterface.dispose();
+    }
 }
 
 /** Options passed to internal LiveGlob constructor */
-type LGOptions = Required<Pick<Options, Exclude<keyof Options, 'cwd'>>>;
+type LGOptions = Required<Pick<Options, Exclude<keyof Options, 'cwd'>>> & {
+    notificationEmitter: NotificationEmitter
+};
 /** Options passed to internal LiveGlobFactory constructor */
-type LGFOptions = Required<Pick<Options, 'cwd'>>;
+type LGFOptions = Required<Pick<Options, 'cwd'>> & {
+    watcherInterface: WatcherInterface;
+};
 
-export class LiveGlob extends AbstractGlobWithDiffState(AbstractGlobState(EventEmitter)) {
+export class LiveGlob extends GlobDiffState(GlobState(Disposable(EventEmitter))) {
     constructor(public readonly globs: ReadonlyArray<string>, private readonly _factory: LiveGlobFactory, {
         initialStateConsideredDirty,
         delimiter,
-        absolute
+        absolute,
+        notificationEmitter
     }: LGOptions) {
         super();
-        register(_factory._watcher, this, true);
+        bindGlobStateToWatcher(notificationEmitter, this, true);
         this._matcher = anymatch(globs as string[]);
         this._forceForwardSlash = delimiter === 'posix';
         this._absolutePaths = absolute;
@@ -120,24 +101,24 @@ export class LiveGlob extends AbstractGlobWithDiffState(AbstractGlobState(EventE
                 }
             }
         }
-        populate(_factory.files, this.files, this.addedFiles);
-        populate(_factory.directories, this.directories, this.addedDirectories);
+        populate(this._factory.files, this.files, this.addedFiles);
+        populate(this._factory.directories, this.directories, this.addedDirectories);
     }
     private readonly _matcher: (p: string) => boolean;
     private readonly _forceForwardSlash: boolean;
     private readonly _absolutePaths: boolean;
     /** @internal */
     matches(rawPath: string) {
-        return this._matcher(rawPath);
+        return this._matcher(this.cwdRelativePath(rawPath));
+    }
+    cwdRelativePath(absolutePath: string) {
+        return Path.relative(this._factory._cwd, absolutePath);
     }
     /** @internal */
     normalizePath(rawPath: string) {
-        const path = this._absolutePaths ? makeAbsolute(this._factory._cwd, rawPath) : rawPath;
+        // rawPath comes straight from the native watcher, so it's absolute with native separators
+        const path = this._absolutePaths ? rawPath : this.cwdRelativePath(rawPath);
         return this._forceForwardSlash ? posixDelim(path) : path;
-    }
-
-    protected _closeIt() {
-        this._factory._childClosed();
     }
 
     on(event: 'add', callback: (filePath: string, stats: Stats | undefined) => void): this;
@@ -152,46 +133,40 @@ export class LiveGlob extends AbstractGlobWithDiffState(AbstractGlobState(EventE
     once(event: 'unlink', callback: (filePath: string) => void): this;
     once(event: 'unlinkDir', callback: (directoryPath: string) => void): this;
     once(event: string, cb: any) { return super.on(event, cb); }
-    emit(event: 'add', filePath: string, stats?: Stats): boolean;
-    emit(event: 'addDir', directoryPath: string, stats?: Stats): boolean;
-    emit(event: 'change', filePath: string, stats?: Stats): boolean;
-    emit(event: 'unlink', filePath: string): boolean;
-    emit(event: 'unlinkDir', directoryPath: string): boolean;
-    emit(event: string, ...args: any[]) { return super.emit(event, ...args); }
+    // emit(event: 'add', filePath: string, stats?: Stats): boolean;
+    // emit(event: 'addDir', directoryPath: string, stats?: Stats): boolean;
+    // emit(event: 'change', filePath: string, stats?: Stats): boolean;
+    // emit(event: 'unlink', filePath: string): boolean;
+    // emit(event: 'unlinkDir', directoryPath: string): boolean;
+    // emit(event: string, ...args: any[]) { return super.emit(event, ...args); }
 }
 
-declare abstract class ___temp1 extends AbstractGlobState(class {}) {}
-export type AbstractGlobState = ___temp1;
+export type GlobStateConstructor = typeof GlobState extends (c: Constructor<Disposable>) => infer C ? C : never;
+export type GlobState = InstanceType<GlobStateConstructor>;
 
-export function AbstractGlobState<C extends Constructor<any>>(Base: C) {
+export function GlobState<C extends Constructor<Disposable>>(Base: C) {
 
-    abstract class _AbstractGlobState extends Base {
+    abstract class _GlobState extends Base {
         /** Set of all matching files on the filesystem, kept up-to-date via watchers */
         readonly files = new Set<string>();
         /** Set of all matching directories on the filesystem, kept up-to-date via watchers */
         readonly directories = new Set<string>();
         /** Should a given path be included in this state? */
-        abstract matches(rawPath: string): boolean;
+        matches(rawPath: string) {return true}
         abstract normalizePath(rawPath: string): string;
-        /** @internal */
-        protected _closed = false;
         close() {
-            if(!this._closed) {
-                this._closed = true;
-                this._closeIt();
-            }
+            this.dispose();
         }
-        protected abstract _closeIt(): void;
     }
 
-    return _AbstractGlobState;
+    return _GlobState;
 }
 
-declare abstract class ___temp2 extends AbstractGlobWithDiffState(AbstractGlobState(class {})) {}
-export type AbstractGlobWithDiffState = ___temp2;
+export type GlobDiffStateConstructor = typeof GlobDiffState extends (c: GlobStateConstructor) => infer C ? C : never;
+export type GlobDiffState = InstanceType<GlobDiffStateConstructor>;
 
-export function AbstractGlobWithDiffState<C extends Constructor<AbstractGlobState>>(Base: C) {
-    abstract class _AbstractGlobWithDiffState extends Base {
+export function GlobDiffState<C extends GlobStateConstructor>(Base: C) {
+    abstract class _GlobDiffState extends Base {
         /** Files that did not exist at the time of last clean() */
         readonly addedFiles = new Set<string>();
         /** Directories that did not exist at the time of last clean() */
@@ -213,69 +188,83 @@ export function AbstractGlobWithDiffState<C extends Constructor<AbstractGlobStat
         }
     }
 
-    return _AbstractGlobWithDiffState;
+    return _GlobDiffState;
 }
 
-function register(w: chokidar.FSWatcher, i: AbstractGlobWithDiffState & EventEmitter, registerDiffLogic: true): void;
-function register(w: chokidar.FSWatcher, i: AbstractGlobState & EventEmitter, registerDiffLogic: false): void;
-function register(w: chokidar.FSWatcher, i: (AbstractGlobState | AbstractGlobWithDiffState) & EventEmitter, registerDiffLogic: boolean) {
-    function filteredEvent(name: string, action: (rawPath: string, normalizedPath: string) => void) {
-        w.on(name, (rawPath, stats) => {
-            if(i._closed) return;
-            if(i.matches(rawPath)) {
-                const normalizedPath = i.normalizePath(rawPath);
-                action(rawPath, normalizedPath);
-                i.emit(name, normalizedPath, stats);
+function bindGlobStateToWatcher(emitter: NotificationEmitter, self: GlobDiffState & EventEmitter, registerDiffLogic: true): void;
+function bindGlobStateToWatcher(emitter: NotificationEmitter, self: GlobState & EventEmitter, registerDiffLogic: false): void;
+function bindGlobStateToWatcher(emitter: NotificationEmitter, self: (GlobState | GlobDiffState) & EventEmitter, registerDiffLogic: boolean) {
+    type EmitName = 'add' | 'addDir' | 'change' | 'unlink' | 'unlinkDir' | 'ready';
+    function filteredEvent(name: keyof NotificationEmitter, action: (rawPath: string, normalizedPath: string) => EmitName | void) {
+        (emitter[name] as EE<[1, (s: string) => void]>).on((rawPath) => {
+            if(self.isDisposed()) return;
+            if(self.matches(rawPath)) {
+                const normalizedPath = self.normalizePath(rawPath);
+                const emitName = action(rawPath, normalizedPath);
+                if(emitName) {
+                    self.emit(emitName, normalizedPath);
+                }
             }
         });
     }
-    function doDiff(i: any): i is AbstractGlobWithDiffState {
+    function doDiff(i: any): i is GlobDiffState {
         return registerDiffLogic;
     }
-    filteredEvent('add', (rawPath, normalizedPath) => {
-        i.files.add(normalizedPath);
-        if(doDiff(i)) {
-            // If file was previously removed, un-remove it
-            if(i.removedFiles.delete(normalizedPath)) {
-                // Removing and re-adding a file marks it changed
-                i.changedFiles.add(normalizedPath);
-            } else {
-                i.addedFiles.add(normalizedPath);
+    filteredEvent('onFileAddedOrChanged', (rawPath, normalizedPath) => {
+        if(self.files.has(normalizedPath)) {
+            // process as change event
+            self.files.add(normalizedPath); // TODO I'm pretty sure adding the path here isn't necessary
+            if(doDiff(self)) {
+                self.changedFiles.add(normalizedPath);
             }
+            return 'change';
+        } else {
+            self.files.add(normalizedPath);
+            if(doDiff(self)) {
+                // If file was previously removed, un-remove it
+                if(self.removedFiles.delete(normalizedPath)) {
+                    // Removing and re-adding a file marks it changed
+                    self.changedFiles.add(normalizedPath);
+                } else {
+                    self.addedFiles.add(normalizedPath);
+                }
+            }
+            return 'add';
         }
     });
-    filteredEvent('addDir', (rawPath, normalizedPath) => {
-        i.directories.add(normalizedPath);
-        if(doDiff(i)) {
-            if(!i.removedDirectories.delete(normalizedPath)) {
-                i.addedDirectories.add(normalizedPath);
+    filteredEvent('onDirectoryAdded', (rawPath, normalizedPath) => {
+        if(!self.directories.has(normalizedPath)) {
+            self.directories.add(normalizedPath);
+            if(doDiff(self)) {
+                if(!self.removedDirectories.delete(normalizedPath)) {
+                    self.addedDirectories.add(normalizedPath);
+                }
             }
+            return 'addDir';
         }
     });
-    filteredEvent('change', (rawPath, normalizedPath) => {
-        i.files.add(normalizedPath); // TODO I'm pretty sure add the path here should be removed.
-        if(doDiff(i)) {
-            i.changedFiles.add(normalizedPath);
+    filteredEvent('onFileRemoved', (rawPath, normalizedPath) => {
+        if(self.files.has(normalizedPath)) {
+            self.files.delete(normalizedPath);
+            if(doDiff(self)) {
+                // If file was already added, it's now gone, as if nothing happened.
+                if(!self.addedFiles.delete(normalizedPath)) {
+                    // Otherwise add it to list of deletions
+                    self.removedFiles.add(normalizedPath);
+                }
+            }
+            return 'unlink';
         }
     });
-    filteredEvent('unlink', (rawPath, normalizedPath) => {
-        console.log('unlink fired', rawPath);
-        i.files.delete(normalizedPath);
-        if(doDiff(i)) {
-            // If file was already added, it's now gone, as if nothing happened.
-            if(!i.addedFiles.delete(normalizedPath)) {
-                // Otherwise add it to list of deletions
-                i.removedFiles.add(normalizedPath);
+    filteredEvent('onDirectoryRemoved', (rawPath, normalizedPath) => {
+        if(self.directories.has(normalizedPath)) {
+            self.directories.delete(normalizedPath);
+            if(doDiff(self)) {
+                if(!self.addedDirectories.delete(normalizedPath)) {
+                    self.removedDirectories.add(normalizedPath);
+                }
             }
-        }
-    });
-    filteredEvent('unlinkDir', (rawPath, normalizedPath) => {
-        console.log('unlinkDir fired', rawPath);
-        i.directories.delete(normalizedPath);
-        if(doDiff(i)) {
-            if(!i.addedDirectories.delete(normalizedPath)) {
-                i.removedDirectories.add(normalizedPath);
-            }
+            return 'unlinkDir';
         }
     });
 }

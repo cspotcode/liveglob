@@ -2,10 +2,16 @@ import * as Path from 'path';
 import * as fs from 'fs';
 import * as m from '../lib/index';
 import { LiveGlob } from '../lib/index';
-import {assert} from 'chai';
-import {sync as rimrafSync} from 'rimraf';
-import {sync as mkdirpSync} from 'mkdirp';
+import { assert} from 'chai';
+import { sync as rimrafSync } from 'rimraf';
+import { sync as mkdirpSync } from 'mkdirp';
 import * as fsExtra from 'fs-extra';
+import { describe, before, beforeEach, after, afterEach, it, xit, xdescribe} from 'mocha';
+
+// Directory watching doesn't work reliably on Windows.
+const testDirWatching = true;
+
+const pause = 0.1e3;
 
 describe('liveglob', () => {
 
@@ -14,15 +20,22 @@ describe('liveglob', () => {
     const fixtureRootRel = 'src/test/fixtures';
     const fixtureRootAbs = toPosix(Path.resolve(fixtureRootRel));
 
-    beforeEach(() => {
+    beforeEach(async () => {
         // Prepare 'bar' as a mutable copy of fixtures
         rimrafSync(Path.join(fixtureRootAbs, 'bar'));
         fsExtra.copySync(Path.join(fixtureRootAbs, 'foo'), Path.join(fixtureRootAbs, 'bar'));
+        await delay(pause);
     });
 
     /** Assert that the items of a set match the contents of an array (ignoring ordering) */
-    function setMatches(set: Set<string>, items: Array<string>) {
-        assert.deepEqual(Array.from(set).sort(), [...items].sort());
+    function setMatches(set: Set<string> | ReadonlyArray<Set<string> | false>, items: Array<string>) {
+        const sets: ReadonlyArray<Set<string> | false> = Array.isArray(set) ? set : [set];
+        const expected = [...items].sort();
+        for(const s of sets) {
+            if(s !== false) {
+                assert.deepEqual(Array.from(s).sort(), expected);
+            }
+        }
     }
 
     function ident<A>(a: A) {return a}
@@ -68,6 +81,20 @@ describe('liveglob', () => {
         return new Promise(res => {setTimeout(res, ms)});
     }
 
+    /** Retry assertions several times till they are eventually true */
+    async function till(assertions: () => Promise<void>) {
+        let err: any;
+        for(let i = 0; i < 10; i++) {
+            try {
+                return await assertions();
+            } catch(e) {
+                err = e;
+            }
+            await delay(pause);
+        }
+        throw err;
+    }
+
     describeEach<[Partial<m.Options> | undefined, boolean]>([
         ['returns relative paths (by default)', [undefined, false]],
         ['returns relative paths (explicit)', [{absolute: false}, false]],
@@ -94,138 +121,157 @@ describe('liveglob', () => {
                     const expectedOutputNormalizer = posix ? ident : toNativeAll;
                     const options = mergeOptions(absOpts, delimOpts, cwdOpts, initialStateDirtyOpts);
 
-                    let lgArray: LiveGlob;
-                    let lgSingle: LiveGlob;
-                    beforeEach(async () => {
-                        lgArray = await m.glob([
-                            `${ globRoot }bar/**/*`
-                        ], options);
-                        lgSingle = await m.glob(
-                            `${ globRoot }bar/**/*`,
-                            options
-                        );
-                        await delay(0.5e3);
+                    let liveglob: LiveGlob;
+
+                    describe('array of globs', () => {
+                        beforeEach(async () => {
+                            liveglob = await m.glob([
+                                `${ globRoot }bar/**/*`
+                            ], options);
+                            await delay(pause);
+                        });
+                        afterEach(async () => {
+                            liveglob.close();
+                        });
+                        declareTests();
                     });
-                    afterEach(async () => {
-                        lgArray.close();
-                        lgSingle.close();
+                    describe('single string glob', () => {
+                        beforeEach(async () => {
+                            liveglob = await m.glob(`${ globRoot }bar/**/*`, options);
+                            await delay(pause);
+                        });
+                        afterEach(async () => {
+                            liveglob.close();
+                        });
+                        declareTests();
                     });
 
-                    it('captures initial state', async () => {
-                        match(lgArray);
-                        match(lgSingle);
+                    function declareTests() {
+                        it('captures initial state', async () => {
+                            await till(async () => match(liveglob));
 
-                        function match(lg: LiveGlob) {
-                            setMatches(lg.directories, expectedOutputNormalizer([
-                                `${ outputRoot }bar/sub`
-                            ]));
-                            setMatches(lg.files, expectedOutputNormalizer([
-                                `${ outputRoot }bar/one.txt`,
-                                `${ outputRoot }bar/two.txt`,
-                                `${ outputRoot }bar/sub/three.txt`
-                            ]));
-                            if(!initialStateConsideredDirty) {
-                            setMatches(lg.addedDirectories, []);
-                            setMatches(lg.addedFiles, []);
-                            setMatches(lg.removedDirectories, []);
-                            setMatches(lg.removedFiles, []);
-                            setMatches(lg.changedFiles, []);
-                            } else {
-                                // TODO
+                            function match(lg: LiveGlob) {
+                                if(testDirWatching) {
+                                    ((e) => {
+                                        setMatches(lg.directories, e);
+                                        initialStateConsideredDirty && setMatches(lg.addedDirectories, e);
+                                    })(expectedOutputNormalizer([
+                                        `${ outputRoot }bar/sub`
+                                    ]));
+                                    if(!initialStateConsideredDirty) {
+                                        setMatches(lg.addedDirectories, []);
+                                        setMatches(lg.removedDirectories, []);
+                                    }
+                                }
+                                ((e) => {
+                                    setMatches(lg.files, e);
+                                    initialStateConsideredDirty && setMatches(lg.addedFiles, e);
+                                })(expectedOutputNormalizer([
+                                    `${ outputRoot }bar/one.txt`,
+                                    `${ outputRoot }bar/two.txt`,
+                                    `${ outputRoot }bar/sub/three.txt`
+                                ]));
+                                if(!initialStateConsideredDirty) {
+                                    setMatches(lg.addedFiles, []);
+                                }
+                                setMatches(lg.removedFiles, []);
+                                setMatches(lg.changedFiles, []);
                             }
-                        }
-                    });
+                        });
 
-                    it('captures additions and deletions', async () => {
-                        const pause = 0.5e3;
+                        it('captures additions and deletions', async () => {
+                            liveglob.clean();
 
-                        touch(`${ fixtureRootAbs }/bar/additional1.txt`);
-                        mkdirpSync(`${ fixtureRootAbs }/bar/newsub`);
-                        touch(`${ fixtureRootAbs }/bar/sub/additional2.txt`);
-                        touch(`${ fixtureRootAbs }/bar/newsub/additional3.txt`);
-                        await delay(pause);
+                            touch(`${ fixtureRootAbs }/bar/additional1.txt`);
+                            mkdirpSync(`${ fixtureRootAbs }/bar/newsub`);
+                            touch(`${ fixtureRootAbs }/bar/sub/additional2.txt`);
+                            touch(`${ fixtureRootAbs }/bar/newsub/additional3.txt`);
+                            await delay(pause);
 
-                        lgArray.clean();
-                        lgSingle.clean();
+                            await till(async () => match(liveglob));
 
-                        match(lgArray);
-                        match(lgSingle);
+                            function match(lg: LiveGlob) {
+                                if(testDirWatching) {
+                                    setMatches([
+                                        lg.directories,
+                                    ], expectedOutputNormalizer([
+                                        `${ outputRoot }bar/sub`,
+                                        `${ outputRoot }bar/newsub`
+                                    ]));
+                                    setMatches(lg.addedDirectories, expectedOutputNormalizer([
+                                        `${ outputRoot }bar/newsub`
+                                    ]));
+                                    setMatches(lg.removedDirectories, []);
+                                }
+                                setMatches(lg.files, expectedOutputNormalizer([
+                                    `${ outputRoot }bar/one.txt`,
+                                    `${ outputRoot }bar/two.txt`,
+                                    `${ outputRoot }bar/sub/three.txt`,
+                                    `${ outputRoot }bar/additional1.txt`,
+                                    `${ outputRoot }bar/sub/additional2.txt`,
+                                    `${ outputRoot }bar/newsub/additional3.txt`
+                                ]));
+                                setMatches(lg.addedFiles, expectedOutputNormalizer([
+                                    `${ outputRoot }bar/additional1.txt`,
+                                    `${ outputRoot }bar/sub/additional2.txt`,
+                                    `${ outputRoot }bar/newsub/additional3.txt`
+                                ]));
+                                setMatches(lg.removedFiles, []);
+                                setMatches(lg.changedFiles, []);
+                            }
 
-                        function match(lg: LiveGlob) {
-                            setMatches(lg.directories, expectedOutputNormalizer([
-                                `${ outputRoot }bar/sub`,
-                                `${ outputRoot }bar/newsub`
-                            ]));
-                            setMatches(lg.addedDirectories, expectedOutputNormalizer([
-                                `${ outputRoot }bar/newsub`
-                            ]));
-                            setMatches(lg.files, expectedOutputNormalizer([
-                                `${ outputRoot }bar/one.txt`,
-                                `${ outputRoot }bar/two.txt`,
-                                `${ outputRoot }bar/sub/three.txt`,
-                                `${ outputRoot }bar/additional1.txt`,
-                                `${ outputRoot }bar/sub/additional2.txt`,
-                                `${ outputRoot }bar/newsub/additional3.txt`
-                            ]));
-                            setMatches(lg.addedFiles, expectedOutputNormalizer([
-                                `${ outputRoot }bar/additional1.txt`,
-                                `${ outputRoot }bar/sub/additional2.txt`,
-                                `${ outputRoot }bar/newsub/additional3.txt`
-                            ]));
-                            setMatches(lg.removedDirectories, []);
-                            setMatches(lg.removedFiles, []);
-                            setMatches(lg.changedFiles, []);
-                        }
+                            rimrafSync(`${ fixtureRootAbs }/bar/sub`);
+                            touch(`${ fixtureRootAbs }/bar/one.txt`);
+                            await delay(pause);
 
-                        rimrafSync(`${ fixtureRootAbs }/bar/sub`);
-                        touch(`${ fixtureRootAbs }/bar/one.txt`);
-                        await delay(pause);
+                            await till(async () => match2(liveglob));
 
-                        match2(lgArray);
-                        match2(lgSingle);
+                            function match2(lg: LiveGlob) {
+                                if(testDirWatching) {
+                                    setMatches(lg.directories, expectedOutputNormalizer([
+                                        `${ outputRoot }bar/newsub`
+                                    ]));
+                                    setMatches(lg.addedDirectories, expectedOutputNormalizer([
+                                        `${ outputRoot }bar/newsub`
+                                    ]));
+                                    setMatches(lg.removedDirectories, expectedOutputNormalizer([
+                                        `${ outputRoot }bar/sub`,
+                                    ]));
+                                }
+                                setMatches(lg.files, expectedOutputNormalizer([
+                                    `${ outputRoot }bar/one.txt`,
+                                    `${ outputRoot }bar/two.txt`,
+                                    `${ outputRoot }bar/additional1.txt`,
+                                    `${ outputRoot }bar/newsub/additional3.txt`
+                                ]));
+                                setMatches(lg.addedFiles, expectedOutputNormalizer([
+                                    `${ outputRoot }bar/additional1.txt`,
+                                    `${ outputRoot }bar/newsub/additional3.txt`
+                                ]));
+                                setMatches(lg.removedFiles, expectedOutputNormalizer([
+                                    // additional2 is *not* considered removed because it did not exist at the time of last clean()
+                                    `${ outputRoot }bar/sub/three.txt`,
+                                ]));
+                                setMatches(lg.changedFiles, expectedOutputNormalizer([
+                                    `${ outputRoot }bar/one.txt`,
+                                ]));
+                            }
 
-                        function match2(lg: LiveGlob) {
-                            setMatches(lg.directories, expectedOutputNormalizer([
-                                `${ outputRoot }bar/newsub`
-                            ]));
-                            setMatches(lg.files, expectedOutputNormalizer([
-                                `${ outputRoot }bar/one.txt`,
-                                `${ outputRoot }bar/two.txt`,
-                                `${ outputRoot }bar/additional1.txt`,
-                                `${ outputRoot }bar/newsub/additional3.txt`
-                            ]));
-                            setMatches(lg.addedDirectories, expectedOutputNormalizer([
-                                `${ outputRoot }bar/newsub`
-                            ]));
-                            setMatches(lg.addedFiles, expectedOutputNormalizer([
-                                `${ outputRoot }bar/additional1.txt`,
-                                `${ outputRoot }bar/newsub/additional3.txt`
-                            ]));
-                            setMatches(lg.removedDirectories, [
-                                `${ outputRoot }bar/sub`,
-                            ]);
-                            setMatches(lg.removedFiles, [
-                                `${ outputRoot }bar/sub/additional2.txt`,
-                            ]);
-                            setMatches(lg.changedFiles, [
-                                `${ outputRoot }bar/one.txt`,
-                            ])
-                        }
+                            liveglob.clean();
 
-                        lgArray.clean();
-                        lgSingle.clean();
+                            await till(async () => match3(liveglob));
 
-                        match3(lgArray);
-                        match3(lgSingle);
-
-                        function match3(lg: LiveGlob) {
-                            setMatches(lg.addedFiles, []);
-                            setMatches(lg.removedFiles, []);
-                            setMatches(lg.addedDirectories, []);
-                            setMatches(lg.removedDirectories, []);
-                            setMatches(lg.changedFiles, []);
-                        }
-                    }).timeout(20e3);
+                            function match3(lg: LiveGlob) {
+                                if(testDirWatching) {
+                                    setMatches(lg.addedDirectories, []);
+                                    setMatches(lg.removedDirectories, []);
+                                }
+                                setMatches(lg.addedFiles, []);
+                                setMatches(lg.removedFiles, []);
+                                setMatches(lg.changedFiles, []);
+                            }
+                        });
+                    }
                 });
             });
         });
