@@ -22,8 +22,12 @@ describe('liveglob', () => {
 
     beforeEach(async () => {
         // Prepare 'bar' as a mutable copy of fixtures
-        rimrafSync(Path.join(fixtureRootAbs, 'bar'));
-        fsExtra.copySync(Path.join(fixtureRootAbs, 'foo'), Path.join(fixtureRootAbs, 'bar'));
+        await till(async () => {
+            rimrafSync(Path.join(fixtureRootAbs, 'bar'));
+        });
+        await till(async () => {
+            fsExtra.copySync(Path.join(fixtureRootAbs, 'foo'), Path.join(fixtureRootAbs, 'bar'));
+        });
         await delay(pause);
     });
 
